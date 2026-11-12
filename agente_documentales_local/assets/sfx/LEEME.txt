@@ -1,0 +1,4 @@
+EFECTOS DE SONIDO (opcional)
+Si coloca aquí whoosh.mp3 y pop.mp3 (o .wav/.ogg/.m4a) se usarán en los cortes de escena.
+Si no, el agente genera con FFmpeg un "whoosh" y un "pop" sencillos (no se descarga nada).
+Use solo efectos con licencia libre o propios.

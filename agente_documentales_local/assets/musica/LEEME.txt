@@ -1,0 +1,7 @@
+MÚSICA DE FONDO (opcional)
+Ponga aquí pistas .mp3/.wav/.m4a/.ogg con derechos claros: música propia, de la Biblioteca de audio de YouTube,
+licencias CC0 / dominio público o con licencia comercial que usted haya adquirido.
+NO ponga canciones comerciales: provocan reclamaciones de derechos y pueden impedir la monetización.
+El agente elige una pista por video (de forma estable según el tema), la repite si es más corta, la baja a
+"musica_volumen" (12 % por defecto), la atenúa automáticamente mientras habla la voz y le aplica fundido final.
+Si esta carpeta está vacía, los videos se hacen sin música (avisa en informe.json).

@@ -1,0 +1,966 @@
+diff -ruN a/agente/guion.py b/agente/guion.py
+--- a/agente/guion.py	2026-10-31 03:43:55.216172226 +0000
++++ b/agente/guion.py	2026-10-31 03:43:55.219417219 +0000
+@@ -226,6 +226,103 @@
+     return "\n\n".join((leer_texto(p) or "").strip() for p in orden if (leer_texto(p) or "").strip())
+ 
+ 
++# ----------------------------------------------------------------------------- duración objetivo
++def wpm_efectivo(cfg, dir_tema):
++    """Palabras por minuto reales de la voz: la última medición de este tema o el valor de config.json."""
++    r = leer_json(Path(dir_tema) / "partes_guion" / "ritmo.json", {}) or {}
++    return float(r.get("wpm") or cfg.get("palabras_por_minuto", 150))
++
++
++def guardar_ritmo(dir_tema, wpm):
++    escribir_json(Path(dir_tema) / "partes_guion" / "ritmo.json", {"wpm": round(float(wpm), 1)})
++
++
++def limite_palabras(cfg, dir_tema):
++    """(objetivo, máximo) de palabras para la duración pedida. Sin duracion_objetivo_min: (palabras_objetivo, None).
++    Nunca baja del mínimo exigido al guion (palabras_minimas + margen)."""
++    dur = float(cfg.get("duracion_objetivo_min") or 0)
++    if dur <= 0:
++        return int(cfg["palabras_objetivo"]), None
++    piso = int(cfg["palabras_minimas"]) + int(cfg["margen_seguridad"])
++    maximo = max(int(dur * wpm_efectivo(cfg, dir_tema)), piso)
++    return max(int(maximo * 0.97), piso), maximo
++
++
++def _bloques(d_partes):
++    n_final = int((leer_json(d_partes / "estructura.json", {}) or {}).get("n", len(SECCIONES)))
++    partes = sorted(d_partes.glob("parte_*.txt"), key=lambda p: _numero(p.name))
++    amps = sorted(d_partes.glob("ampliacion_*.txt"), key=lambda p: _numero(p.name))
++    aporte = [d_partes / "aporte.txt"] if (d_partes / "aporte.txt").exists() else []
++    orden = [p for p in partes if _numero(p.name) < n_final] + aporte + amps + \
++        [p for p in partes if _numero(p.name) == n_final]
++    res = []
++    for p in orden:
++        t = (leer_texto(p) or "").strip()
++        if not t:
++            continue
++        if p.name.startswith("ampliacion"):
++            tipo = "amp"
++        elif p.name == "aporte.txt":
++            tipo = "aporte"
++        else:
++            num = _numero(p.name)
++            tipo = "intro" if num == 1 else ("conclusion" if num == n_final else "medio")
++        res.append({"tipo": tipo, "texto": t, "orig": contar_palabras(t)})
++    return res
++
++
++def _recortar_parrafos(texto, objetivo, min_frases=3):
++    """Quita frases completas del final del bloque hasta no pasar de `objetivo` palabras (conserva los párrafos)."""
++    parrafos = [tx.dividir_frases(p) for p in texto.split("\n\n") if p.strip()]
++    total = sum(len(p) for p in parrafos)
++    while total > min_frases and contar_palabras("\n\n".join(" ".join(p) for p in parrafos)) > objetivo:
++        while parrafos and not parrafos[-1]:
++            parrafos.pop()
++        parrafos[-1].pop()
++        total -= 1
++        if not parrafos[-1]:
++            parrafos.pop()
++    return "\n\n".join(" ".join(p) for p in parrafos if p)
++
++
++def ensamblar_con_limite(d_partes, maximo, piso=0):
++    """Guion final ajustado a `maximo` palabras SIN tocar las partes guardadas: primero se descartan las ampliaciones,
++    luego se recortan frases del final de las secciones centrales (se conserva la introducción, el aporte propio y la
++    conclusión). Devuelve (texto, {'quitadas': n})."""
++    bloques = _bloques(d_partes)
++    pal = lambda: sum(contar_palabras(b["texto"]) for b in bloques)  # noqa: E731
++    inicial = pal()
++    if maximo and inicial > maximo:
++        for b in [b for b in bloques if b["tipo"] == "amp"][::-1]:
++            if pal() <= maximo:
++                break
++            if pal() - contar_palabras(b["texto"]) >= piso:
++                bloques.remove(b)
++        for conserva in (0.55, 0.40):
++            if pal() <= maximo:
++                break
++            medios = [b for b in bloques if b["tipo"] == "medio"]
++            base = sum(contar_palabras(b["texto"]) for b in medios)
++            exceso = min(pal() - maximo, pal() - piso)
++            if not medios or exceso <= 0:
++                break
++            for b in medios:
++                w = contar_palabras(b["texto"])
++                objetivo_b = max(int(w - exceso * w / float(base)), int(b["orig"] * conserva))
++                b["texto"] = _recortar_parrafos(b["texto"], objetivo_b)
++    texto = "\n\n".join(b["texto"] for b in bloques)
++    return texto, {"quitadas": max(0, inicial - contar_palabras(texto))}
++
++
++def reescribir_guion_largo(dir_tema, cfg, maximo):
++    """Vuelve a escribir guion_largo.txt ajustado a `maximo` palabras (para corregir la duración real medida)."""
++    dir_tema = Path(dir_tema)
++    piso = int(cfg["palabras_minimas"]) + int(cfg["margen_seguridad"])
++    texto, info = ensamblar_con_limite(dir_tema / "partes_guion", maximo, piso)
++    escribir_texto(dir_tema / "guion_largo.txt", texto + "\n")
++    return texto, info
++
++
+ def _progreso(dir_tema, d_partes, log):
+     t = ensamblar(d_partes)
+     escribir_texto(dir_tema / "guion_largo_en_progreso.txt", t)
+@@ -237,7 +334,9 @@
+     d_partes = dir_tema / "partes_guion"
+     d_partes.mkdir(parents=True, exist_ok=True)
+     res = {"completo": False, "palabras": 0, "advertencias": [], "secciones_faltantes": [], "ampliaciones": 0}
+-    objetivo = int(cfg["palabras_objetivo"])
++    objetivo, maximo = limite_palabras(cfg, dir_tema)
++    if maximo:
++        log.info(f"Duración objetivo: {cfg['duracion_objetivo_min']} min -> ~{objetivo} palabras (máximo {maximo}).")
+     secciones, g_idx, nombre_est = elegir_estructura(tema, d_partes, cfg)
+     res["estructura"] = nombre_est
+     log.info(f"Estructura narrativa: {nombre_est}")
+@@ -247,15 +346,20 @@
+         res["aporte_palabras"] = contar_palabras(aporte)
+         log.info(f"Aporte propio incluido en el guion ({contar_palabras(aporte)} palabras).")
+     previas = []
++    acum_obj = acum_pal = 0                    # el modelo suele pasarse de largo: se corrige sección a sección
+     for i, (titulo, peso, instr) in enumerate(secciones, 1):
+         if i == 1:
+             instr = instr + " " + GANCHOS[g_idx]
+         ruta = _ruta_parte(d_partes, i)
+         n_obj = max(80, round(objetivo * peso))
++        if maximo and acum_pal and acum_obj:
++            n_obj = max(80, int(n_obj * min(1.0, max(0.55, acum_obj / float(acum_pal)))))
+         existente = (leer_texto(ruta) or "").strip()
+         if existente and contar_palabras(existente) >= int(n_obj * 0.6):
+             log.info(f"Sección {i} ya guardada ({contar_palabras(existente)} palabras): se reutiliza.")
+             previas.append((titulo, existente))
++            acum_obj += n_obj
++            acum_pal += contar_palabras(existente)
+             continue
+         log.info(f"Generando sección {i}/{len(secciones)}: {titulo} (objetivo ~{n_obj} palabras)")
+         t, aviso = _generar_seccion(cfg, tema, notas, i, titulo, instr, n_obj, previas, log, llm, len(secciones))
+@@ -270,6 +374,8 @@
+             res["secciones_faltantes"].append(i)
+             continue
+         previas.append((titulo, t))
++        acum_obj += n_obj
++        acum_pal += contar_palabras(t)
+         _progreso(dir_tema, d_partes, log)
+ 
+     # Ampliaciones: las ya guardadas cuentan siempre; se generan más solo si hace falta.
+@@ -305,7 +411,12 @@
+         total = _progreso(dir_tema, d_partes, log)
+     res["ampliaciones"] = len(list(d_partes.glob("ampliacion_*.txt")))
+ 
+-    texto = ensamblar(d_partes)
++    piso = int(cfg["palabras_minimas"]) + int(cfg["margen_seguridad"])
++    texto, info_rec = ensamblar_con_limite(d_partes, maximo, piso)
++    res["recortado"] = info_rec["quitadas"]
++    if info_rec["quitadas"]:
++        log.info(f"Guion ajustado a la duración pedida: se quitaron {info_rec['quitadas']} palabras "
++                 "(las partes originales siguen guardadas).")
+     res["palabras"] = contar_palabras(texto)
+     if res["secciones_faltantes"]:
+         res["advertencias"].append(f"Faltan secciones: {res['secciones_faltantes']}. Se conserva el borrador.")
+diff -ruN a/agente/ollama_cli.py b/agente/ollama_cli.py
+--- a/agente/ollama_cli.py	1970-01-01 00:00:00.000000000 +0000
++++ b/agente/ollama_cli.py	2026-10-31 03:43:55.220210459 +0000
+@@ -0,0 +1,74 @@
++# -*- coding: utf-8 -*-
++"""Ayudas para los scripts de consola (chat_voz.py y ollama_pptx.py) que usan el paquete `ollama` de Python
++(ollama.chat). Convierte los errores típicos en mensajes entendibles en español, sin traceback."""
++
++
++class OllamaCliError(Exception):
++    """Mensaje ya redactado en español."""
++
++
++def importar_ollama():
++    try:
++        import ollama
++        return ollama
++    except ImportError:
++        raise OllamaCliError("Falta el paquete de Python 'ollama'. Instálelo en el entorno virtual: pip install ollama")
++
++
++def _es_conexion(e):
++    nombre = type(e).__name__.lower()
++    return isinstance(e, (ConnectionError, OSError)) or "connect" in nombre or "connect" in str(e).lower() \
++        or "refused" in str(e).lower() or "10061" in str(e)
++
++
++def nombres_modelos(lista):
++    """Nombres de modelos instalados, con versiones nuevas (objetos) y antiguas (diccionarios) del paquete."""
++    modelos = lista["models"] if isinstance(lista, dict) else getattr(lista, "models", [])
++    res = []
++    for m in modelos:
++        n = m.get("model") or m.get("name") if isinstance(m, dict) else (getattr(m, "model", None) or getattr(m, "name", None))
++        if n:
++            res.append(n)
++    return res
++
++
++def mensaje_ollama_apagado():
++    return ("No se pudo conectar con Ollama. Abra la aplicación Ollama (icono en la bandeja de Windows) o ejecute "
++            "'ollama serve' en otra ventana de PowerShell, y vuelva a intentarlo.")
++
++
++def mensaje_modelo_inexistente(modelo, instalados=()):
++    extra = f" Modelos instalados: {', '.join(instalados)}." if instalados else ""
++    return (f"El modelo '{modelo}' no está instalado en Ollama.{extra} Descárguelo con: ollama pull {modelo}  "
++            "o elija otro con --modelo.")
++
++
++def verificar(modelo):
++    """Comprueba que Ollama responde y que el modelo existe. Lanza OllamaCliError con un mensaje claro."""
++    ollama = importar_ollama()
++    try:
++        instalados = nombres_modelos(ollama.list())
++    except Exception as e:  # noqa: BLE001
++        if _es_conexion(e):
++            raise OllamaCliError(mensaje_ollama_apagado())
++        raise OllamaCliError(f"Ollama devolvió un error al consultar los modelos: {e}")
++    if modelo not in instalados and f"{modelo}:latest" not in instalados:
++        raise OllamaCliError(mensaje_modelo_inexistente(modelo, instalados))
++    return instalados
++
++
++def chat(modelo, mensajes, **kw):
++    """ollama.chat con errores traducidos. Devuelve el texto de la respuesta."""
++    ollama = importar_ollama()
++    try:
++        r = ollama.chat(model=modelo, messages=mensajes, **kw)
++    except Exception as e:  # noqa: BLE001
++        if getattr(e, "status_code", None) == 404 or "not found" in str(e).lower():
++            raise OllamaCliError(mensaje_modelo_inexistente(modelo))
++        if _es_conexion(e):
++            raise OllamaCliError(mensaje_ollama_apagado())
++        raise OllamaCliError(f"Ollama no pudo responder: {e}")
++    try:
++        return r["message"]["content"]
++    except (KeyError, TypeError):
++        return r.message.content
+diff -ruN a/agente/utils.py b/agente/utils.py
+--- a/agente/utils.py	2026-10-31 03:43:55.216809937 +0000
++++ b/agente/utils.py	2026-10-31 03:43:55.218664517 +0000
+@@ -24,6 +24,8 @@
+     "ollama_timeout_seg": 900,
+     "ollama_num_ctx": 4096,
+     "palabras_objetivo": 1450,
++    "duracion_objetivo_min": 10,         # el documental largo NO pasará de estos minutos (0 = usar palabras_objetivo)
++    "palabras_por_minuto": 150,          # ritmo de la voz; se corrige solo con la duración real medida
+     "palabras_minimas": 1000,
+     "margen_seguridad": 60,
+     "max_ampliaciones": 6,
+@@ -49,7 +51,12 @@
+     "descripcion_aviso": "Narración con voz sintética (IA). Guion y estructura elaborados con ayuda de inteligencia "
+                          "artificial a partir de fuentes públicas; puede contener imprecisiones.",
+     "modo_video": "escenas",            # "escenas" (zooms, SFX, música, subtítulos ASS) o "clasico"
+-    "motor_voz": "auto",                # auto: edge-tts si funciona, si no voz local | edge | local
++    "motor_voz": "auto",                # auto: edge-tts -> Kokoro (si están sus archivos) -> voz local | kokoro | edge | local
++    "kokoro_modelo": "",                # ruta de kokoro-v1.0.onnx (vacío = buscar o usar KOKORO_MODEL)
++    "kokoro_voces": "",                 # ruta de voices-v1.0.bin   (vacío = buscar o usar KOKORO_VOICES)
++    "kokoro_voz": "ef_dora",            # ef_dora | em_alex | em_santa
++    "kokoro_velocidad": 1.0,            # 0.5 a 2.0
++    "kokoro_lang": "es",
+     "edge_voz": "es-MX-JorgeNeural",    # también: es-ES-AlvaroNeural, es-AR-TomasNeural...
+     "edge_rate": "+0%",
+     "edge_pitch": "+0Hz",
+diff -ruN a/agente/voz_kokoro.py b/agente/voz_kokoro.py
+--- a/agente/voz_kokoro.py	1970-01-01 00:00:00.000000000 +0000
++++ b/agente/voz_kokoro.py	2026-10-31 03:43:55.220139350 +0000
+@@ -0,0 +1,176 @@
++# -*- coding: utf-8 -*-
++"""Voz local con Kokoro-82M (paquete kokoro-onnx). Sin Internet: usa los archivos kokoro-v1.0.onnx y
++voices-v1.0.bin que ya tiene en su PC. Lo usan chat_voz.py, ollama_pptx.py y el agente de documentales."""
++import os
++import re
++import tempfile
++from pathlib import Path
++
++from .texto import _RE_EMOJI
++from .voz import VozError, dividir_en_trozos
++
++NOMBRE_MODELO = "kokoro-v1.0.onnx"
++NOMBRE_VOCES = "voices-v1.0.bin"
++VOCES_ES = ("ef_dora", "em_alex", "em_santa")        # voces en español de Kokoro v1.0
++RAIZ = Path(__file__).resolve().parent.parent
++
++
++class KokoroError(Exception):
++    """Error con mensaje ya redactado en español, listo para mostrar al usuario."""
++
++
++# ----------------------------------------------------------------------------- archivos
++def _buscar(valor, nombre):
++    """Devuelve (ruta o None, lista de rutas probadas)."""
++    if valor:
++        p = Path(valor).expanduser()
++        if p.is_dir():
++            p = p / nombre
++        return (p if p.is_file() else None), [p]
++    candidatos = [Path.cwd() / nombre, RAIZ / nombre, RAIZ / "kokoro" / nombre, RAIZ / "assets" / "kokoro" / nombre]
++    for c in candidatos:
++        if c.is_file():
++            return c, candidatos
++    return None, candidatos
++
++
++def localizar_archivos(modelo=None, voces=None):
++    """Ruta de kokoro-v1.0.onnx y voices-v1.0.bin. Orden: argumento > variables KOKORO_MODEL / KOKORO_VOICES >
++    carpeta actual > carpeta del programa > kokoro\\ > assets\\kokoro\\."""
++    m, probadas_m = _buscar(modelo or os.environ.get("KOKORO_MODEL"), NOMBRE_MODELO)
++    v, probadas_v = _buscar(voces or os.environ.get("KOKORO_VOICES"), NOMBRE_VOCES)
++    faltan = []
++    if m is None:
++        faltan.append((NOMBRE_MODELO, probadas_m))
++    if v is None:
++        faltan.append((NOMBRE_VOCES, probadas_v))
++    if faltan:
++        lineas = ["No se encontraron los archivos de Kokoro:"]
++        for nombre, rutas in faltan:
++            lineas.append(f"  - {nombre}  (buscado en: {'; '.join(str(r) for r in rutas[:4])})")
++        lineas.append("Coloque ambos archivos en la carpeta del programa (o en kokoro\\) o indique su ubicación con las "
++                      "variables de entorno KOKORO_MODEL y KOKORO_VOICES, por ejemplo en PowerShell:")
++        lineas.append('  $env:KOKORO_MODEL  = "C:\\ruta\\kokoro-v1.0.onnx"')
++        lineas.append('  $env:KOKORO_VOICES = "C:\\ruta\\voices-v1.0.bin"')
++        raise KokoroError("\n".join(lineas))
++    return m, v
++
++
++# ----------------------------------------------------------------------------- texto
++_RE_URL = re.compile(r"https?://\S+|www\.\S+")
++
++
++def limpiar_para_voz(texto):
++    """Quita emojis, markdown, enlaces y símbolos que Kokoro leería mal."""
++    t = _RE_URL.sub("", texto or "")
++    t = _RE_EMOJI.sub("", t)
++    t = re.sub(r"```.*?```", " ", t, flags=re.S)
++    t = re.sub(r"^\s*(#{1,6}|[-*•]|\d+[.)])\s+", "", t, flags=re.M)
++    t = re.sub(r"[*_`~#>|]+", "", t)
++    t = re.sub(r"\s*\n\s*", ". ", t)
++    t = re.sub(r"\.\s*\.", ".", t)
++    return re.sub(r"\s+", " ", t).strip()
++
++
++# ----------------------------------------------------------------------------- motor
++class KokoroTTS:
++    def __init__(self, modelo=None, voces=None, voz="ef_dora", velocidad=1.0, lang="es"):
++        ruta_m, ruta_v = localizar_archivos(modelo, voces)
++        try:
++            from kokoro_onnx import Kokoro
++            import numpy  # noqa: F401
++            import soundfile  # noqa: F401
++        except ImportError as e:
++            raise KokoroError(f"Falta un paquete de Python para Kokoro ({e.name or e}). Instálelo en el entorno virtual: "
++                              "pip install kokoro-onnx soundfile")
++        try:
++            self.kokoro = Kokoro(str(ruta_m), str(ruta_v))
++        except Exception as e:  # noqa: BLE001
++            raise KokoroError(f"No se pudo cargar Kokoro con {ruta_m.name} y {ruta_v.name}: {e}")
++        try:
++            disponibles = list(self.kokoro.get_voices())
++        except Exception:  # noqa: BLE001 - versiones antiguas sin get_voices
++            disponibles = list(VOCES_ES)
++        if voz not in disponibles:
++            es = [v for v in disponibles if v in VOCES_ES] or list(VOCES_ES)
++            raise KokoroError(f"La voz '{voz}' no existe en voices-v1.0.bin. Voces en español: {', '.join(es)}.")
++        self.voz, self.lang = voz, lang
++        try:
++            self.velocidad = float(velocidad)
++        except (TypeError, ValueError):
++            raise KokoroError(f"La velocidad '{velocidad}' no es un número (use por ejemplo 1.0).")
++        self.velocidad = min(2.0, max(0.5, self.velocidad))
++        self.modelo_ruta, self.voces_ruta = ruta_m, ruta_v
++
++    def audio(self, texto):
++        """(muestras float32, frecuencia). Divide el texto en trozos de frases para no pasar el límite de Kokoro."""
++        import numpy as np
++        trozos = dividir_en_trozos(limpiar_para_voz(texto), 300)
++        if not trozos:
++            raise KokoroError("No hay texto para convertir en voz.")
++        partes, sr = [], 24000
++        for t in trozos:
++            try:
++                muestras, sr = self.kokoro.create(t, voice=self.voz, speed=self.velocidad, lang=self.lang)
++            except Exception as e:  # noqa: BLE001
++                raise KokoroError(f"Kokoro falló al generar la voz: {e}")
++            partes.append(np.asarray(muestras, dtype="float32"))
++            partes.append(np.zeros(int(0.12 * sr), dtype="float32"))     # pausa breve entre trozos
++        return np.concatenate(partes[:-1]), sr
++
++    def guardar(self, texto, ruta):
++        """Genera el audio y lo guarda como .wav con soundfile. Devuelve la ruta."""
++        import soundfile as sf
++        muestras, sr = self.audio(texto)
++        ruta = Path(ruta)
++        ruta.parent.mkdir(parents=True, exist_ok=True)
++        sf.write(str(ruta), muestras, sr)
++        return ruta
++
++    sintetizar = guardar        # misma interfaz que los demás motores del agente de documentales
++
++
++def reproducir_wav(ruta):
++    """Reproduce el .wav y espera a que termine. winsound (incluido en Windows); si no, sounddevice si existe.
++    Devuelve True si sonó, False si no se pudo (sin lanzar excepciones)."""
++    try:
++        import winsound
++        winsound.PlaySound(str(ruta), winsound.SND_FILENAME)
++        return True
++    except ImportError:
++        pass
++    except Exception:  # noqa: BLE001
++        return False
++    try:
++        import sounddevice as sd
++        import soundfile as sf
++        datos, sr = sf.read(str(ruta))
++        sd.play(datos, sr)
++        sd.wait()
++        return True
++    except Exception:  # noqa: BLE001
++        return False
++
++
++# ----------------------------------------------------------------------------- integración con el agente de documentales
++class MotorKokoro:
++    """Mismo contrato que MotorVoz/MotorEdge: .tipo, .voz, .voz_es, .advertencias, .sintetizar(texto, destino)."""
++    tipo = "kokoro"
++
++    def __init__(self, cfg, log):
++        self.log, self.advertencias = log, []
++        try:
++            self._tts = KokoroTTS(cfg.get("kokoro_modelo") or None, cfg.get("kokoro_voces") or None,
++                                  os.environ.get("KOKORO_VOZ") or cfg.get("kokoro_voz", "ef_dora"),
++                                  os.environ.get("KOKORO_SPEED") or cfg.get("kokoro_velocidad", 1.0),
++                                  cfg.get("kokoro_lang", "es"))
++        except KokoroError as e:
++            raise VozError(str(e))
++        self.voz, self.voz_es = self._tts.voz, self._tts.voz.startswith(("ef_", "em_"))
++        self._tts.guardar("Hola.", Path(tempfile.gettempdir()) / "kokoro_sonda.wav")   # comprobación inicial
++
++    def sintetizar(self, texto, destino):
++        try:
++            self._tts.guardar(texto, destino)
++        except KokoroError as e:
++            raise VozError(str(e))
+diff -ruN a/chat_voz.py b/chat_voz.py
+--- a/chat_voz.py	1970-01-01 00:00:00.000000000 +0000
++++ b/chat_voz.py	2026-10-31 03:43:55.220996777 +0000
+@@ -0,0 +1,148 @@
++# -*- coding: utf-8 -*-
++"""Conversación por turnos: usted escribe, Llama (Ollama) responde y Kokoro lee la respuesta en voz alta.
++Termina cuando escribe "salir".
++
++Ajustes (de mayor a menor prioridad): argumentos de la línea de comandos > variables de entorno > config.json >
++valores por defecto.
++  Variables: OLLAMA_MODEL, KOKORO_VOZ (ef_dora | em_alex | em_santa), KOKORO_SPEED, KOKORO_LANG,
++             KOKORO_MODEL (ruta de kokoro-v1.0.onnx), KOKORO_VOICES (ruta de voices-v1.0.bin)
++"""
++import argparse
++import os
++import re
++import sys
++from pathlib import Path
++
++RAIZ = Path(__file__).resolve().parent
++sys.path.insert(0, str(RAIZ))
++
++from agente import ollama_cli, voz_kokoro                       # noqa: E402
++from agente.utils import cargar_config                           # noqa: E402
++
++SISTEMA = ("Eres un asistente conversacional que habla en español. Responde de forma concisa y natural, en dos o tres "
++           "frases, como si hablaras en voz alta. No uses emojis, listas, tablas, markdown ni símbolos extraños. Si no "
++           "sabes algo, dilo con honestidad.")
++MAX_MENSAJES = 16        # historial que se envía al modelo (además del mensaje de sistema)
++
++
++def _config():
++    try:
++        return cargar_config(RAIZ / "config.json")
++    except (OSError, ValueError):
++        return {}
++
++
++def parsear(argv=None):
++    cfg = _config()
++    ap = argparse.ArgumentParser(description="Conversación por voz con Llama (Ollama) y Kokoro.")
++    ap.add_argument("--modelo", default=os.environ.get("OLLAMA_MODEL") or cfg.get("modelo_ollama") or "llama3.2:3b",
++                    help="modelo de Ollama (por defecto el de config.json)")
++    ap.add_argument("--voz", default=os.environ.get("KOKORO_VOZ") or cfg.get("kokoro_voz") or "ef_dora",
++                    help="voz de Kokoro: ef_dora, em_alex o em_santa")
++    ap.add_argument("--velocidad", default=os.environ.get("KOKORO_SPEED") or cfg.get("kokoro_velocidad") or 1.0,
++                    help="velocidad de la voz, de 0.5 a 2.0 (por defecto 1.0)")
++    ap.add_argument("--lang", default=os.environ.get("KOKORO_LANG") or "es", help="idioma de Kokoro (por defecto es)")
++    ap.add_argument("--elegir", action="store_true", help="elegir voz y velocidad en pantalla antes de empezar")
++    ap.add_argument("--sin-voz", action="store_true", help="conversar solo con texto (sin Kokoro)")
++    ap.add_argument("--sin-reproducir", action="store_true", help="guardar los .wav pero no reproducirlos")
++    ap.add_argument("--carpeta-audio", default="audio_chat", help="carpeta donde se guardan los .wav")
++    ap.add_argument("--kokoro-modelo", default=None, help="ruta de kokoro-v1.0.onnx")
++    ap.add_argument("--kokoro-voces", default=None, help="ruta de voices-v1.0.bin")
++    return ap.parse_args(argv)
++
++
++def elegir_interactivo(voz, velocidad):
++    print("\nVoces disponibles en español:")
++    for i, v in enumerate(voz_kokoro.VOCES_ES, 1):
++        print(f"  {i}) {v}{'  (actual)' if v == voz else ''}")
++    r = input(f"Elija una voz [Enter = {voz}]: ").strip()
++    if r.isdigit() and 1 <= int(r) <= len(voz_kokoro.VOCES_ES):
++        voz = voz_kokoro.VOCES_ES[int(r) - 1]
++    elif r in voz_kokoro.VOCES_ES:
++        voz = r
++    r = input(f"Velocidad de 0.5 a 2.0 [Enter = {velocidad}]: ").strip().replace(",", ".")
++    try:
++        velocidad = float(r) if r else velocidad
++    except ValueError:
++        print("Velocidad no válida: se mantiene la anterior.")
++    return voz, velocidad
++
++
++def _limpiar_respuesta(t):
++    return re.sub(r"<think>.*?</think>", "", t or "", flags=re.S).strip()
++
++
++def conversar(args, tts):
++    historial = [{"role": "system", "content": SISTEMA}]
++    carpeta = Path(args.carpeta_audio)
++    n = 0
++    while True:
++        try:
++            texto = input("\nTú: ").strip()
++        except (EOFError, KeyboardInterrupt):
++            print("\nConversación terminada.")
++            return
++        if not texto:
++            continue
++        if texto.lower() == "salir":
++            print("Hasta luego.")
++            return
++        historial.append({"role": "user", "content": texto})
++        try:
++            enviado = [historial[0]] + historial[1:][-MAX_MENSAJES:]
++            respuesta = _limpiar_respuesta(ollama_cli.chat(args.modelo, enviado, options={"temperature": 0.6}))
++        except ollama_cli.OllamaCliError as e:
++            print(f"\n[ERROR] {e}")
++            historial.pop()                        # el turno fallido no queda en el historial
++            continue
++        if not respuesta:
++            print("\n[AVISO] El modelo devolvió una respuesta vacía. Intente reformular la pregunta.")
++            historial.pop()
++            continue
++        historial.append({"role": "assistant", "content": respuesta})
++        print(f"\nAsistente: {respuesta}")
++        if tts is None:
++            continue
++        n += 1
++        ruta = carpeta / f"respuesta_{n:04d}.wav"
++        try:
++            tts.guardar(respuesta, ruta)
++            print(f"[audio guardado en {ruta}]")
++            if not args.sin_reproducir and not voz_kokoro.reproducir_wav(ruta):
++                print("[AVISO] No se pudo reproducir el audio automáticamente; ábralo desde la carpeta indicada.")
++        except voz_kokoro.KokoroError as e:
++            print(f"[AVISO] {e}")
++        except Exception as e:  # noqa: BLE001 - un fallo de audio no debe cortar la conversación
++            print(f"[AVISO] No se pudo generar o guardar el audio: {e}")
++
++
++def main(argv=None):
++    args = parsear(argv)
++    try:
++        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
++    except (AttributeError, OSError):
++        pass
++    if args.elegir:
++        args.voz, args.velocidad = elegir_interactivo(args.voz, args.velocidad)
++    try:
++        ollama_cli.verificar(args.modelo)
++    except ollama_cli.OllamaCliError as e:
++        print(f"[ERROR] {e}")
++        return 1
++    tts = None
++    if not args.sin_voz:
++        try:
++            tts = voz_kokoro.KokoroTTS(args.kokoro_modelo, args.kokoro_voces, args.voz, args.velocidad, args.lang)
++        except voz_kokoro.KokoroError as e:
++            print(f"[ERROR] {e}\nPuede conversar solo con texto usando la opción --sin-voz.")
++            return 2
++    print("=" * 60)
++    print(f"Modelo: {args.modelo}" + ("" if tts is None else f" | Voz: {tts.voz} | Velocidad: {tts.velocidad}"))
++    print('Escriba su mensaje y pulse Enter. Escriba "salir" para terminar.')
++    print("=" * 60)
++    conversar(args, tts)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff -ruN a/config.json b/config.json
+--- a/config.json	2026-10-31 03:43:55.217356730 +0000
++++ b/config.json	2026-10-31 03:43:55.221141969 +0000
+@@ -80,5 +80,12 @@
+     "crf": 26,
+     "audio_bitrate": "128k",
+     "threads": 2
+-  }
++  },
++  "duracion_objetivo_min": 10,
++  "palabras_por_minuto": 150,
++  "kokoro_modelo": "",
++  "kokoro_voces": "",
++  "kokoro_voz": "ef_dora",
++  "kokoro_velocidad": 1.0,
++  "kokoro_lang": "es"
+ }
+\ No newline at end of file
+diff -ruN a/main.py b/main.py
+--- a/main.py	2026-10-31 03:43:55.217263689 +0000
++++ b/main.py	2026-10-31 03:43:55.220920861 +0000
+@@ -9,7 +9,7 @@
+ from pathlib import Path
+ 
+ from agente import (calidad, guion, investigacion, ollama, produccion, publicacion, subtitulos, video, voz,
+-                    voz_edge)
++                    voz_edge, voz_kokoro)
+ from agente.utils import (EXT_IMAGEN, EXT_VIDEO, ahora, cargar_config, configurar_log, contar_palabras,
+                           dimensiones_imagen, escribir_json, hash_texto, leer_json, leer_texto, nombre_seguro,
+                           tam_archivo, validar_config)
+@@ -46,17 +46,29 @@
+ def crear_motor(cfg, ctx):
+     """edge-tts (voz neuronal) si está disponible; si no, voz local. 'edge' y 'local' fuerzan una u otra."""
+     modo = cfg.get("motor_voz", "auto")
++    if modo == "kokoro":
++        return voz_kokoro.MotorKokoro(cfg, ctx.log)
++    fallo = ""
+     if modo in ("auto", "edge"):
+         try:
+             return voz_edge.MotorEdge(cfg, ctx.log, ctx.ffmpeg)
+         except voz.VozError as e:
+             if modo == "edge":
+                 raise
+-            ctx.log.warning(f"edge-tts no disponible ({e}); se usa la voz local.")
+-            m = voz.MotorVoz(cfg, ctx.log)
+-            m.advertencias.insert(0, f"Se usó la voz local porque edge-tts no estaba disponible: {e}")
++            fallo = f"edge-tts no disponible ({e})"
++            ctx.log.warning(f"{fallo}.")
++    if modo == "auto":                                  # Kokoro solo si sus archivos están en el PC
++        try:
++            voz_kokoro.localizar_archivos(cfg.get("kokoro_modelo") or None, cfg.get("kokoro_voces") or None)
++            m = voz_kokoro.MotorKokoro(cfg, ctx.log)
++            m.advertencias.insert(0, f"Se usó Kokoro (local) porque {fallo or 'edge-tts no se eligió'}.")
+             return m
+-    return voz.MotorVoz(cfg, ctx.log)
++        except (voz.VozError, voz_kokoro.KokoroError) as e:
++            ctx.log.info(f"Kokoro no disponible ({str(e).splitlines()[0]}).")
++    m = voz.MotorVoz(cfg, ctx.log)
++    if fallo:
++        m.advertencias.insert(0, f"Se usó la voz local porque {fallo}.")
++    return m
+ 
+ 
+ def tema_completado(out):
+@@ -250,6 +262,31 @@
+                 mc = int(cfg.get("escena_max_caracteres_short" if clave == "short" else "escena_max_caracteres", 170)) \
+                     if esc else 350
+                 meta = voz.sintetizar_texto(ctx.motor, texto_fn(), out / wav, log, clave, mc, esc)
++                if clave == "largo" and cfg.get("duracion_objetivo_min"):
++                    limite = float(cfg["duracion_objetivo_min"]) * 60
++                    for _ in range(2):                         # medir la duración REAL y recortar si se pasa
++                        if meta["duracion"] <= limite:
++                            break
++                        palabras = contar_palabras(guion_largo)
++                        wpm_real = palabras / meta["duracion"] * 60
++                        nuevo_max = int(limite * 0.985 * wpm_real / 60)
++                        log.warning(f"El documental dura {int(meta['duracion'] // 60)}:{int(meta['duracion'] % 60):02d} y "
++                                    f"el máximo es {int(limite // 60)}:00: se recorta el guion a ~{nuevo_max} palabras.")
++                        guion.guardar_ritmo(out, wpm_real)
++                        texto2, _ = guion.reescribir_guion_largo(out, cfg, nuevo_max)
++                        if contar_palabras(texto2) >= palabras:
++                            break
++                        guion_largo = texto2
++                        meta = voz.sintetizar_texto(ctx.motor, guion_largo, out / wav, log, clave, mc, esc)
++                    inf["palabras_largo"] = contar_palabras(guion_largo)
++                    d = meta["duracion"]
++                    if d > limite + 1:
++                        inf["advertencias"].append(f"El documental dura {int(d // 60)}:{int(d % 60):02d}, por encima de "
++                                                   f"los {cfg['duracion_objetivo_min']} min pedidos (no se pudo recortar más "
++                                                   "sin bajar del mínimo de palabras).")
++                    else:
++                        log.info(f"Duración del documental largo: {int(d // 60)}:{int(d % 60):02d} "
++                                 f"(máximo {cfg['duracion_objetivo_min']}:00).")
+                 n = subtitulos.generar_srt(meta["trozos"], out / srt)
+                 prob = subtitulos.validar_srt(out / srt, meta["duracion"])
+                 if prob:
+@@ -426,7 +463,8 @@
+     carpeta.mkdir(exist_ok=True)
+     frase = ("Hola. Esta es una prueba de voz para tus documentales. Si escuchas una voz natural, con entonación "
+              "humana, es la voz neuronal de Microsoft Edge. Si suena robótica, es la voz básica de Windows.")
+-    fabricas = [("edge", lambda: voz_edge.MotorEdge(cfg, ctx.log, ctx.ffmpeg)), ("local", lambda: voz.MotorVoz(cfg, ctx.log))]
++    fabricas = [("edge", lambda: voz_edge.MotorEdge(cfg, ctx.log, ctx.ffmpeg)),
++                ("kokoro", lambda: voz_kokoro.MotorKokoro(cfg, ctx.log)), ("local", lambda: voz.MotorVoz(cfg, ctx.log))]
+     ok = {}
+     for nombre, fab in fabricas:
+         try:
+@@ -439,7 +477,8 @@
+             print(f"[NO DISPONIBLE] {nombre}: {e}")
+             ok[nombre] = False
+     modo = cfg.get("motor_voz", "auto")
+-    usa = "edge-tts" if ok.get("edge") and modo in ("auto", "edge") else "voz local"
++    usa = ("kokoro" if modo == "kokoro" else "edge-tts" if ok.get("edge") and modo in ("auto", "edge") else
++           "kokoro" if ok.get("kokoro") and modo == "auto" else "voz local")
+     print(f"\nCon motor_voz='{modo}' el agente usará: {usa}.")
+     if not ok.get("edge"):
+         print("Para activar edge-tts: ejecute instalar.bat (instala el paquete edge-tts) y compruebe su conexión a Internet.")
+diff -ruN a/ollama_pptx.py b/ollama_pptx.py
+--- a/ollama_pptx.py	1970-01-01 00:00:00.000000000 +0000
++++ b/ollama_pptx.py	2026-10-31 03:43:55.221060845 +0000
+@@ -0,0 +1,248 @@
++# -*- coding: utf-8 -*-
++"""Genera una presentación .pptx a partir de un tema usando Llama (Ollama) con salida JSON:
++    {"slides": [{"title": "...", "bullets": ["..."], "notes": "..."}]}
++El JSON se valida (y se reintenta si viene mal) y se convierte en diapositivas con título, viñetas y notas del orador.
++Con --voz se genera además un .wav por diapositiva con Kokoro, leyendo las notas.
++
++Necesita python-pptx:  pip install python-pptx   (kokoro-onnx, soundfile y ollama ya los tiene instalados)
++"""
++import argparse
++import json
++import os
++import re
++import sys
++from pathlib import Path
++
++RAIZ = Path(__file__).resolve().parent
++sys.path.insert(0, str(RAIZ))
++
++from agente import ollama_cli, voz_kokoro                       # noqa: E402
++from agente.escenas import _bloque_json, _reparar                # noqa: E402
++from agente.texto import _RE_EMOJI, parece_espanol               # noqa: E402
++from agente.utils import cargar_config, nombre_seguro            # noqa: E402
++
++SISTEMA = ('Eres un asistente que diseña presentaciones en español. Devuelves ÚNICAMENTE un objeto JSON válido con '
++           'la forma {"slides":[{"title":"...","bullets":["...","..."],"notes":"..."}]}, sin texto adicional ni '
++           'markdown. Reglas: "title" breve (máximo 70 caracteres); "bullets" de 3 a 5 viñetas cortas (máximo 110 '
++           'caracteres cada una); "notes" son las notas del orador, de 2 a 4 frases (40 a 90 palabras) para leer en '
++           'voz alta. No uses emojis. No inventes cifras ni citas: si no estás seguro de un dato, no lo incluyas.')
++
++
++def _config():
++    try:
++        return cargar_config(RAIZ / "config.json")
++    except (OSError, ValueError):
++        return {}
++
++
++# ----------------------------------------------------------------------------- validación del JSON
++def _texto(v, maximo):
++    if not isinstance(v, (str, int, float)):
++        return ""
++    t = _RE_EMOJI.sub("", str(v))
++    t = re.sub(r"[*`#]+", "", t)
++    t = re.sub(r"\s+", " ", t).strip()
++    if len(t) > maximo:
++        t = t[:maximo].rsplit(" ", 1)[0].rstrip(" ,;:") + "..."
++    return t
++
++
++def parsear_json(crudo):
++    """json.loads y, si falla, reparación tolerante. None si no hay forma de interpretarlo."""
++    t = re.sub(r"<think>.*?</think>", "", crudo or "", flags=re.S).strip()
++    for cand in (t, _bloque_json(t) or ""):
++        for s in (cand, _reparar(cand) if cand else ""):
++            if not s:
++                continue
++            try:
++                return json.loads(s, strict=False)
++            except ValueError:
++                continue
++    return None
++
++
++def validar(obj, n):
++    """Devuelve (slides, errores). Cada slide: {'title','bullets','notes'}."""
++    lista = None
++    if isinstance(obj, dict):
++        for k in ("slides", "diapositivas", "presentacion"):
++            if isinstance(obj.get(k), list):
++                lista = obj[k]
++                break
++    elif isinstance(obj, list):
++        lista = obj
++    if not lista:
++        return [], ['falta la lista "slides" o está vacía']
++    slides, errores = [], []
++    for i, s in enumerate(lista, 1):
++        if not isinstance(s, dict):
++            errores.append(f"diapositiva {i}: no es un objeto JSON")
++            continue
++        titulo = _texto(s.get("title") or s.get("titulo") or s.get("título"), 90)
++        vin = s.get("bullets") or s.get("vinetas") or s.get("viñetas") or s.get("puntos")
++        if isinstance(vin, str):
++            vin = [x for x in re.split(r"[\n;]+", vin) if x.strip()]
++        vin = [b for b in (_texto(x, 140) for x in (vin if isinstance(vin, list) else [])) if b][:7]
++        notas = _texto(s.get("notes") or s.get("notas"), 1200)
++        if not titulo:
++            errores.append(f"diapositiva {i}: falta el título (title)")
++        if not vin:
++            errores.append(f"diapositiva {i}: la lista bullets está vacía")
++        if not notas:
++            errores.append(f"diapositiva {i}: faltan las notas (notes)")
++        if titulo and vin and notas and len(notas.split()) >= 15 and not parece_espanol(notas + " " + " ".join(vin)):
++            errores.append(f"diapositiva {i}: el texto no está en español")
++        slides.append({"title": titulo, "bullets": vin, "notes": notas})
++    if len(slides) < n:
++        errores.append(f"se pidieron {n} diapositivas y llegaron {len(slides)}")
++    return slides[:n], errores
++
++
++def pedir_slides(modelo, tema, n, intentos=3):
++    mensajes = [{"role": "system", "content": SISTEMA},
++                {"role": "user", "content": f"Tema de la presentación: {tema}\nNúmero de diapositivas: {n}\n"
++                                            "Devuelve únicamente el JSON."}]
++    ultimo_error = "respuesta vacía"
++    for k in range(1, intentos + 1):
++        crudo = ollama_cli.chat(modelo, mensajes, format="json",
++                                options={"temperature": 0.4, "num_ctx": 4096, "num_predict": 2800})
++        obj = parsear_json(crudo)
++        if obj is None:
++            errores, slides = ["la respuesta no era un JSON válido"], []
++        else:
++            slides, errores = validar(obj, n)
++        if not errores:
++            return slides
++        solo_cantidad = slides and all(e.startswith("se pidieron") for e in errores) and \
++            all(s["title"] and s["bullets"] and s["notes"] for s in slides)
++        if k == intentos and solo_cantidad:
++            print(f"[AVISO] El modelo entregó {len(slides)} diapositivas en lugar de {n}.")
++            return slides
++        ultimo_error = "; ".join(errores[:4])
++        print(f"[AVISO] Intento {k}/{intentos}: {ultimo_error}.")
++        mensajes += [{"role": "assistant", "content": (crudo or "")[:1500]},
++                     {"role": "user", "content": f"Tu respuesta tuvo estos problemas: {ultimo_error}. Devuelve de nuevo "
++                                                 f"SOLO el JSON corregido, con exactamente {n} diapositivas."}]
++    raise ollama_cli.OllamaCliError(f"El modelo no devolvió un JSON válido tras {intentos} intentos ({ultimo_error}). "
++                                    "Pruebe con --modelo, con menos diapositivas o vuelva a ejecutar.")
++
++
++# ----------------------------------------------------------------------------- .pptx
++def importar_pptx():
++    try:
++        import pptx  # noqa: F401
++        return pptx
++    except ImportError:
++        raise ollama_cli.OllamaCliError("Falta python-pptx. Instálelo en el entorno virtual con: pip install python-pptx")
++
++
++def crear_pptx(slides, ruta, tema=""):
++    importar_pptx()
++    from pptx import Presentation
++    from pptx.util import Inches, Pt
++    prs = Presentation()
++    prs.slide_width, prs.slide_height = Inches(13.333), Inches(7.5)          # 16:9
++    layout = prs.slide_layouts[1]                                             # título y contenido
++    for s in slides:
++        diap = prs.slides.add_slide(layout)
++        titulo, cuerpo = diap.shapes.title, diap.placeholders[1]
++        titulo.left, titulo.top, titulo.width, titulo.height = Inches(0.8), Inches(0.4), Inches(11.7), Inches(1.3)
++        cuerpo.left, cuerpo.top, cuerpo.width, cuerpo.height = Inches(0.8), Inches(1.9), Inches(11.7), Inches(5.0)
++        titulo.text = s["title"]
++        for p in titulo.text_frame.paragraphs:
++            for r in p.runs:
++                r.font.size = Pt(36)
++                r.font.bold = True
++        tf = cuerpo.text_frame
++        tf.word_wrap = True
++        tam = Pt(28 if len(s["bullets"]) <= 4 else 24 if len(s["bullets"]) <= 5 else 20)
++        for k, b in enumerate(s["bullets"]):
++            p = tf.paragraphs[0] if k == 0 else tf.add_paragraph()
++            p.text = b
++            for r in p.runs:
++                r.font.size = tam
++        diap.notes_slide.notes_text_frame.text = s["notes"]                   # notas del orador
++    prs.core_properties.title = tema or "Presentación"
++    ruta = Path(ruta)
++    ruta.parent.mkdir(parents=True, exist_ok=True)
++    prs.save(str(ruta))
++    return ruta
++
++
++# ----------------------------------------------------------------------------- programa
++def parsear(argv=None):
++    cfg = _config()
++    ap = argparse.ArgumentParser(description="Crea un .pptx en español con Llama (Ollama, salida JSON).")
++    ap.add_argument("tema", nargs="*", help="tema de la presentación (si se omite, se pregunta)")
++    ap.add_argument("-n", "--diapositivas", type=int, default=8, help="número de diapositivas (por defecto 8)")
++    ap.add_argument("-o", "--salida", default=None, help="archivo .pptx de salida (por defecto presentaciones\\<tema>.pptx)")
++    ap.add_argument("--modelo", default=os.environ.get("OLLAMA_MODEL") or cfg.get("modelo_ollama") or "llama3.2:3b")
++    ap.add_argument("--voz", action="store_true", help="generar también un .wav por diapositiva con Kokoro (lee las notas)")
++    ap.add_argument("--voz-nombre", default=os.environ.get("KOKORO_VOZ") or cfg.get("kokoro_voz") or "ef_dora",
++                    help="voz de Kokoro: ef_dora, em_alex o em_santa")
++    ap.add_argument("--velocidad", default=os.environ.get("KOKORO_SPEED") or cfg.get("kokoro_velocidad") or 1.0)
++    ap.add_argument("--lang", default=os.environ.get("KOKORO_LANG") or "es")
++    ap.add_argument("--kokoro-modelo", default=None)
++    ap.add_argument("--kokoro-voces", default=None)
++    return ap.parse_args(argv)
++
++
++def main(argv=None):
++    args = parsear(argv)
++    try:
++        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
++    except (AttributeError, OSError):
++        pass
++    tema = " ".join(args.tema).strip()
++    if not tema:
++        try:
++            tema = input("Tema de la presentación: ").strip()
++        except (EOFError, KeyboardInterrupt):
++            tema = ""
++    if not tema:
++        print("[ERROR] Debe indicar un tema.")
++        return 2
++    if not 1 <= args.diapositivas <= 30:
++        print("[ERROR] El número de diapositivas debe estar entre 1 y 30.")
++        return 2
++    try:
++        importar_pptx()
++        ollama_cli.verificar(args.modelo)
++        tts = None
++        if args.voz:                                      # se comprueba antes de gastar tiempo con el modelo
++            try:
++                tts = voz_kokoro.KokoroTTS(args.kokoro_modelo, args.kokoro_voces, args.voz_nombre, args.velocidad, args.lang)
++            except voz_kokoro.KokoroError as e:
++                print(f"[ERROR] {e}\nEjecute sin --voz para generar solo la presentación.")
++                return 2
++        print(f"Generando {args.diapositivas} diapositivas sobre '{tema}' con {args.modelo}...")
++        slides = pedir_slides(args.modelo, tema, args.diapositivas)
++    except ollama_cli.OllamaCliError as e:
++        print(f"[ERROR] {e}")
++        return 1
++    salida = Path(args.salida) if args.salida else Path("presentaciones") / f"{nombre_seguro(tema)}.pptx"
++    try:
++        crear_pptx(slides, salida, tema)
++    except ollama_cli.OllamaCliError as e:
++        print(f"[ERROR] {e}")
++        return 1
++    except OSError as e:
++        print(f"[ERROR] No se pudo guardar {salida}: {e}. ¿Está abierto en PowerPoint?")
++        return 1
++    print(f"[OK] Presentación guardada: {salida} ({len(slides)} diapositivas con notas del orador)")
++    if tts:
++        carpeta = salida.with_name(salida.stem + "_audio")
++        fallos = 0
++        for i, s in enumerate(slides, 1):
++            try:
++                ruta = tts.guardar(s["notes"], carpeta / f"diapositiva_{i:02d}.wav")
++                print(f"[OK] Audio {i}/{len(slides)}: {ruta}")
++            except Exception as e:  # noqa: BLE001
++                fallos += 1
++                print(f"[AVISO] Diapositiva {i}: no se pudo generar el audio ({e})")
++        return 3 if fallos else 0
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())

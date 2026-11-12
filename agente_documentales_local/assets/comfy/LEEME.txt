@@ -1,0 +1,8 @@
+IMÁGENES CON COMFYUI (opcional, desactivado por defecto)
+1) En ComfyUI active "Dev mode options" y use "Save (API Format)" para exportar su workflow como
+   assets/comfy/workflow_api.json
+2) Abra el JSON, localice el nodo "CLIPTextEncode" del prompt positivo y anote su número (p. ej. "6").
+3) En config.json: "comfyui": {"activar": true, "nodo_texto": "6", "max_por_tema": 6, ...}
+AVISO: sin GPU NVIDIA, Stable Diffusion en CPU tarda varios minutos por imagen. Con un i3 genere pocas
+imágenes por tema (max_por_tema) o no lo use. Las imágenes generadas se guardan en
+<salida>\<tema>\imagenes_generadas y se mezclan con sus imágenes locales.

@@ -1,0 +1,11 @@
+# Solo si quiere afinar los subtítulos palabra por palabra con reconocimiento de voz (ligero en CPU):
+faster-whisper>=1.0.0
+# Alternativa (más pesada, instala PyTorch):  openai-whisper
+
+# Kokoro (voz local, chat_voz.py, ollama_pptx.py --voz). Ya instalados en su entorno; archivos aparte:
+#   kokoro-v1.0.onnx y voices-v1.0.bin (junto al programa, en kokoro\ o con KOKORO_MODEL / KOKORO_VOICES)
+kokoro-onnx
+soundfile
+ollama
+# Presentaciones (.pptx):
+python-pptx
